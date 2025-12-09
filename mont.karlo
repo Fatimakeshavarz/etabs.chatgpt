@@ -1,0 +1,159 @@
+import os
+import comtypes.client
+import numpy as np
+import pandas as pd
+import time
+from datetime import datetime
+
+# ===================== تنظیمات اولیه =====================
+ETABS_PATH = r"C:\Program Files\Computers and Structures\ETABS 23\ETABS.exe"  # تغییر دهید
+MODEL_PATH = r"D:\MyModels\MyBuilding.EDB"  # مسیر مدل اصلی شما (باید وجود داشته باشد)
+
+N_SAMPLES = 1000  # تعداد نمونه‌های مونت‌کارلو
+
+# متغیرهای تصادفی (مثال واقعی)
+random_variables = {
+    'Fc'   : {'mean': 30,   'std': 4,     'dist': 'normal',    'unit': 'MPa'},     # مقاومت بتن
+    'Fy'   : {'mean': 400,  'std': 30,    'dist': 'normal',    'unit': 'MPa'},     # مقاومت فولاد
+    'Dead' : {'mean': 1.00, 'std': 0.10,  'dist': 'normal'},                     # ضریب بار مرده
+    'Live' : {'mean': 1.00, 'std': 0.25,  'dist': 'lognormal'},                  # ضریب بار زنده
+    'E_Concrete': {'mean': 1.00, 'std': 0.15, 'dist': 'normal'},              # مدول الاستیسیته بتن
+}
+
+# نتایج مورد نظر برای استخراج
+desired_results = [
+    "Story Drifts",      # دریفت طبقات
+    "Base Shear",        # برش پایه
+    "Frame Forces",      # نیروها در المان‌ها (اختیاری)
+]
+
+# =========================================================
+def connect_to_etabs():
+    try:
+        ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
+    except:
+        ETABSObject = comtypes.client.CreateObject("CSI.ETABS.API.ETABSObject")
+        ETABSObject.ApplicationStart()
+    return ETABSObject
+
+def open_model(smodel, path):
+    ret = smodel.File.OpenFile(path)
+    if ret != 0:
+        print(f"خطا در باز کردن مدل: {path}")
+        return False
+    return True
+
+def set_material_properties(smodel, Fc, Fy, E_mult):
+    # ⚠️ این تابع فرض می‌کند متریال‌ها از قبل در مدل تعریف شده‌اند.
+    conc_name = "CONC"       # نام دقیق متریال بتن در مدل
+    steel_name = "A615Gr60"  # نام دقیق متریال فولاد در مدل
+
+    # مثال ساده برای بتن
+    # E تقریبی بتن (MPa)؛ این فقط یک فرمول نمادین است، باید با واحدهای مدل خودت چک شود
+    E_conc = 4700 * np.sqrt(Fc) * E_mult
+
+    # اگر امضای SetMPIsotropic شبیه (Name, E, U, A, G) باشد، باید بقیه را هم بدهی.
+    # اینجا فقط اسکلت کار را می‌گذارم، پارامترهای دقیق را از مستندات ETABS خودت چک کن:
+    ret = smodel.PropMaterial.SetMPIsotropic(conc_name, E_conc, 0.2, 1e-5)
+    if ret != 0:
+        print("خطا در تنظیم خواص بتن")
+
+    # فولاد – باز هم فقط اسکلت
+    # فرض: Fy به MPa است
+    E_steel = 200000.0  # MPa فرضی برای فولاد
+    ret = smodel.PropMaterial.SetMPIsotropic(steel_name, E_steel, 0.3, 1.2e-5)
+    if ret != 0:
+        print("خطا در تنظیم خواص فولاد")
+
+
+def set_load_multipliers(smodel, dead_mult, live_mult):
+    combo_name = "Combo 1"  # نام ترکیب بارت در مدل
+
+    # معماری کلی: اول لیست کیس‌های موجود در این کامبو را بگیر،
+    # بعد ضریب‌های D و L را با dead_mult و live_mult ضرب کن و دوباره ست کن.
+    NumberItems, LoadCases, ScaleFactors = smodel.RespCombo.GetCaseList(combo_name)
+
+    new_scale_factors = []
+    for lc, sf in zip(LoadCases, ScaleFactors):
+        if lc == "DEAD":
+            new_scale_factors.append(sf * dead_mult)
+        elif lc == "LIVE":
+            new_scale_factors.append(sf * live_mult)
+        else:
+            new_scale_factors.append(sf)
+
+    # بعد با متد تنظیم لیست (مثلاً SetCaseList) دوباره ست کن
+    # ⚠️ اسم و امضای دقیق متد را باید از مستندات ETABS چک کنی
+    # smodel.RespCombo.SetCaseList(combo_name, NumberItems, LoadCases, new_scale_factors)
+
+
+    
+def run_analysis(smodel):
+    smodel.Analyze.RunAnalysis()
+
+def get_max_drift(smodel):
+    res = smodel.Results.StoryDrifts()
+    if not res or res[0] != 0:
+        return None
+
+    # بازکردن تاپل کامل
+    _, NumberResults, Obj, Story, LoadCase, StepType, StepNum, Direction, Drift, X, Y, Z = res
+
+    if NumberResults == 0:
+        return None
+
+    # Drift یک لیست است
+    return max(abs(d) for d in Drift if d is not None)
+
+
+
+def get_base_shear(smodel):
+    res = smodel.Results.BaseReact()
+    if not res or res[0] != 0:
+        return None
+
+    _, NumberResults, LoadCase, StepType, StepNum, F1, F2, F3, M1, M2, M3 = res
+
+    if NumberResults == 0:
+        return None# فرض: F1 و F2 و ... لیست هستند
+    max_fx = max(abs(f) for f in F1)
+    max_fy = max(abs(f) for f in F2)
+
+    return max(max_fx, max_fy)
+
+
+
+# ===================== مونت‌کارلو اصلی =====================
+results = []
+
+ETABS = connect_to_etabs()
+smodel = ETABS.SapModel
+
+print(f"شروع مونت‌کارلو با {N_SAMPLES} نمونه...")
+start_time = time.time()
+
+
+
+
+
+
+def connect_to_etabs():
+    try:
+        # اگر ETABS بازه بهش وصل می‌شیم
+        ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
+    except:
+        # وگرنه خودش ETABS رو اجرا می‌کنه
+        ETABSObject = comtypes.client.CreateObject("CSI.ETABS.API.ETABSObject")
+        # بهتره از مسیر مشخص‌شده استفاده کنیم
+        ETABSObject.ApplicationStart(ETABS_PATH)
+    return ETABSObject
+
+ETABS = connect_to_etabs()
+smodel = ETABS.SapModel
+
+# حتماً مدل رو باز کن
+if not open_model(smodel, MODEL_PATH):
+    raise RuntimeError(f"مدل {MODEL_PATH} باز نشد")
+
+print(f"شروع مونت‌کارلو با {N_SAMPLES} نمونه...")
+start_time = time.time()

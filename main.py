@@ -1,22 +1,50 @@
 # main.py
-from etabs_interface import connect_to_etabs, disconnect_from_etabs, print_model_path
+import importlib.util
+from pathlib import Path
+from etabs_chatgpt import load_model_from_path
+from etabs_interface import disconnect_from_etabs, print_model_path
+
+
+def _load_monte_carlo_module():
+    script_path = Path(__file__).with_name("mont.karlo")
+    if not script_path.exists():
+        raise FileNotFoundError(f"فایل مونت‌کارلو یافت نشد: {script_path}")
+
+    spec = importlib.util.spec_from_file_location("monte_carlo_script", script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("عدم توانایی در ساخت spec برای mont.karlo")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 if __name__ == "__main__":
-    print("در حال اتصال به ETABS...")
     try:
-        etabs_obj, sap_model = connect_to_etabs(visible=True)
-        
-        # تست: یک مدل جدید بساز
-        ret = sap_model.InitializeNewModel(0)  # 0 = kN-m-C
-        if ret == 0:
-            print("مدل جدید با موفقیت ساخته شد")
-        
-        # تست: نام مدل
-        print_model_path(sap_model)
-        
-        input("\nETABS باز است! Enter بزن تا بسته بشه...")
-        disconnect_from_etabs(etabs_obj, close_etabs=True)
-        
+        file_path = input("مسیر فایل ETABS (.edb) را وارد کنید: ").strip().strip('"').strip("'")
+        if not file_path:
+            print("مسیر خالی است؛ عملیات لغو شد.")
+        else:
+            etabs_obj, sap_model = load_model_from_path(file_path, visible=True)
+            try:
+                print_model_path(sap_model)
+
+                # خواندن و اجرای مونت‌کارلو از فایل mont.karlo
+                mc_module = _load_monte_carlo_module()
+                sample_input = input("تعداد نمونه مونت‌کارلو (خالی = 10): ").strip()
+                n_samples = int(sample_input) if sample_input else mc_module.DEFAULT_N_SAMPLES
+
+                print(f"اجرای مونت‌کارلو با {n_samples} نمونه...")
+                results = mc_module.run_monte_carlo(
+                    sap_model,
+                    n_samples=n_samples,
+                    verbose=True,
+                )
+                print(f"تعداد نتایج ثبت‌شده: {len(results)}")
+
+                input("\nETABS باز است؛ Enter بزن تا بسته شود...")
+            finally:
+                disconnect_from_etabs(etabs_obj, close_etabs=True)
     except Exception as e:
         print(f"خطا: {e}")
         input("Enter بزن تا خارج بشی...")

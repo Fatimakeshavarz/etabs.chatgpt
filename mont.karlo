@@ -1,159 +1,233 @@
-import os
-import comtypes.client
-import numpy as np
-import pandas as pd
 import time
 from datetime import datetime
+import numpy as np
+import pandas as pd
 
-# ===================== تنظیمات اولیه =====================
-ETABS_PATH = r"C:\Program Files\Computers and Structures\ETABS 23\ETABS.exe"  # تغییر دهید
-MODEL_PATH = r"D:\MyModels\MyBuilding.EDB"  # مسیر مدل اصلی شما (باید وجود داشته باشد)
+# تنظیمات پیش‌فرض
+DEFAULT_N_SAMPLES = 10
+DEFAULT_COMBO_NAME = "Combo 1"
+DEFAULT_CONCRETE_NAME = "CONC"
+DEFAULT_STEEL_NAME = "A615Gr60"
 
-N_SAMPLES = 1000  # تعداد نمونه‌های مونت‌کارلو
-
-# متغیرهای تصادفی (مثال واقعی)
+# متغیرهای تصادفی نمونه
 random_variables = {
-    'Fc'   : {'mean': 30,   'std': 4,     'dist': 'normal',    'unit': 'MPa'},     # مقاومت بتن
-    'Fy'   : {'mean': 400,  'std': 30,    'dist': 'normal',    'unit': 'MPa'},     # مقاومت فولاد
-    'Dead' : {'mean': 1.00, 'std': 0.10,  'dist': 'normal'},                     # ضریب بار مرده
-    'Live' : {'mean': 1.00, 'std': 0.25,  'dist': 'lognormal'},                  # ضریب بار زنده
-    'E_Concrete': {'mean': 1.00, 'std': 0.15, 'dist': 'normal'},              # مدول الاستیسیته بتن
+    "Fc": {"mean": 30, "std": 4, "dist": "normal", "unit": "MPa"},  # مقاومت بتن
+    "Fy": {"mean": 400, "std": 30, "dist": "normal", "unit": "MPa"},  # مقاومت فولاد
+    "Dead": {"mean": 1.00, "std": 0.10, "dist": "normal"},  # ضریب بار مرده
+    "Live": {"mean": 1.00, "std": 0.25, "dist": "lognormal"},  # ضریب بار زنده
+    "E_Concrete": {"mean": 1.00, "std": 0.15, "dist": "normal"},  # ضریب اصلاح مدول بتن
 }
 
-# نتایج مورد نظر برای استخراج
-desired_results = [
-    "Story Drifts",      # دریفت طبقات
-    "Base Shear",        # برش پایه
-    "Frame Forces",      # نیروها در المان‌ها (اختیاری)
-]
 
-# =========================================================
-def connect_to_etabs():
-    try:
-        ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
-    except:
-        ETABSObject = comtypes.client.CreateObject("CSI.ETABS.API.ETABSObject")
-        ETABSObject.ApplicationStart()
-    return ETABSObject
+def _sample_random_variables(rng, config):
+    samples = {}
+    for name, props in config.items():
+        dist = props.get("dist", "normal")
+        mean = props.get("mean", 0.0)
+        std = props.get("std", 0.0)
 
-def open_model(smodel, path):
-    ret = smodel.File.OpenFile(path)
-    if ret != 0:
-        print(f"خطا در باز کردن مدل: {path}")
-        return False
-    return True
+        if dist == "normal":
+            value = float(rng.normal(mean, std))
+        elif dist == "lognormal":
+            # تبدیل میانگین/انحراف معیار به پارامترهای لاگ نرمال
+            variance = std**2
+            mu = np.log((mean**2) / np.sqrt(variance + mean**2))
+            sigma = np.sqrt(np.log(1 + variance / (mean**2)))
+            value = float(rng.lognormal(mu, sigma))
+        else:
+            raise ValueError(f"توزیع ناشناخته برای {name}: {dist}")
 
-def set_material_properties(smodel, Fc, Fy, E_mult):
-    # ⚠️ این تابع فرض می‌کند متریال‌ها از قبل در مدل تعریف شده‌اند.
-    conc_name = "CONC"       # نام دقیق متریال بتن در مدل
-    steel_name = "A615Gr60"  # نام دقیق متریال فولاد در مدل
+        samples[name] = value
+    return samples
 
-    # مثال ساده برای بتن
-    # E تقریبی بتن (MPa)؛ این فقط یک فرمول نمادین است، باید با واحدهای مدل خودت چک شود
-    E_conc = 4700 * np.sqrt(Fc) * E_mult
 
-    # اگر امضای SetMPIsotropic شبیه (Name, E, U, A, G) باشد، باید بقیه را هم بدهی.
-    # اینجا فقط اسکلت کار را می‌گذارم، پارامترهای دقیق را از مستندات ETABS خودت چک کن:
-    ret = smodel.PropMaterial.SetMPIsotropic(conc_name, E_conc, 0.2, 1e-5)
-    if ret != 0:
-        print("خطا در تنظیم خواص بتن")
+def set_material_properties(smodel, Fc, Fy, e_multiplier=1.0):
+    """
+    ست کردن خواص متریال‌ها (با حدس امضای تابع ETABS).
+    اگر API متفاوت باشد، فقط هشدار چاپ می‌شود.
+    """
+    conc_name = DEFAULT_CONCRETE_NAME
+    steel_name = DEFAULT_STEEL_NAME
 
-    # فولاد – باز هم فقط اسکلت
-    # فرض: Fy به MPa است
+    # مدول بتن برحسب MPa (تقریبی)
+    E_conc = max(0.0, 4700.0 * np.sqrt(max(Fc, 0.0)) * e_multiplier)
     E_steel = 200000.0  # MPa فرضی برای فولاد
-    ret = smodel.PropMaterial.SetMPIsotropic(steel_name, E_steel, 0.3, 1.2e-5)
-    if ret != 0:
-        print("خطا در تنظیم خواص فولاد")
+
+    try:
+        ret = smodel.PropMaterial.SetMPIsotropic(conc_name, E_conc, 0.2, 1e-5)
+        if ret != 0:
+            print("هشدار: تنظیم خواص بتن ناموفق بود.")
+    except Exception as exc:
+        print(f"هشدار: تنظیم خواص بتن انجام نشد ({exc})")
+
+    try:
+        ret = smodel.PropMaterial.SetMPIsotropic(steel_name, E_steel, 0.3, 1.2e-5)
+        if ret != 0:
+            print("هشدار: تنظیم خواص فولاد ناموفق بود.")
+    except Exception as exc:
+        print(f"هشدار: تنظیم خواص فولاد انجام نشد ({exc})")
 
 
-def set_load_multipliers(smodel, dead_mult, live_mult):
-    combo_name = "Combo 1"  # نام ترکیب بارت در مدل
+def set_load_multipliers(smodel, dead_mult, live_mult, combo_name=DEFAULT_COMBO_NAME):
+    """
+    ضرایب بار مرده/زنده را در یک کامبو به‌روز می‌کند.
+    اگر API متفاوت باشد، فقط هشدار چاپ می‌شود.
+    """
+    try:
+        res = smodel.RespCombo.GetCaseList(combo_name)
+    except Exception as exc:
+        print(f"هشدار: خواندن لیست کیس‌های {combo_name} ممکن نشد ({exc})")
+        return
 
-    # معماری کلی: اول لیست کیس‌های موجود در این کامبو را بگیر،
-    # بعد ضریب‌های D و L را با dead_mult و live_mult ضرب کن و دوباره ست کن.
-    NumberItems, LoadCases, ScaleFactors = smodel.RespCombo.GetCaseList(combo_name)
+    if not res or res[0] != 0:
+        print(f"هشدار: دریافت کیس‌های {combo_name} با خطا مواجه شد.")
+        return
+
+    _, number_items, load_cases, scale_factors = res
+    if number_items == 0:
+        print(f"هشدار: کامبو {combo_name} خالی است.")
+        return
 
     new_scale_factors = []
-    for lc, sf in zip(LoadCases, ScaleFactors):
-        if lc == "DEAD":
+    for lc, sf in zip(load_cases, scale_factors):
+        name_upper = str(lc).upper()
+        if name_upper.startswith("DEAD"):
             new_scale_factors.append(sf * dead_mult)
-        elif lc == "LIVE":
+        elif name_upper.startswith("LIVE"):
             new_scale_factors.append(sf * live_mult)
         else:
             new_scale_factors.append(sf)
 
-    # بعد با متد تنظیم لیست (مثلاً SetCaseList) دوباره ست کن
-    # ⚠️ اسم و امضای دقیق متد را باید از مستندات ETABS چک کنی
-    # smodel.RespCombo.SetCaseList(combo_name, NumberItems, LoadCases, new_scale_factors)
+    try:
+        smodel.RespCombo.SetCaseList(combo_name, number_items, load_cases, new_scale_factors)
+    except Exception as exc:
+        print(f"هشدار: به‌روزرسانی ضرایب کامبو ممکن نشد ({exc})")
 
 
-    
 def run_analysis(smodel):
-    smodel.Analyze.RunAnalysis()
+    ret = smodel.Analyze.RunAnalysis()
+    if ret != 0:
+        raise RuntimeError(f"RunAnalysis خطا داد (کد {ret})")
+
 
 def get_max_drift(smodel):
-    res = smodel.Results.StoryDrifts()
+    try:
+        res = smodel.Results.StoryDrifts()
+    except Exception:
+        return None
+
     if not res or res[0] != 0:
         return None
 
-    # بازکردن تاپل کامل
-    _, NumberResults, Obj, Story, LoadCase, StepType, StepNum, Direction, Drift, X, Y, Z = res
-
-    if NumberResults == 0:
+    _, number_results, *_rest = res
+    if number_results == 0:
         return None
 
-    # Drift یک لیست است
-    return max(abs(d) for d in Drift if d is not None)
+    # انتظار داریم Drift نزدیک انتهای تاپل باشد
+    Drift = res[-4] if len(res) >= 4 else None
+    if Drift is None:
+        return None
 
+    try:
+        return max(abs(d) for d in Drift if d is not None)
+    except Exception:
+        return None
 
 
 def get_base_shear(smodel):
-    res = smodel.Results.BaseReact()
+    try:
+        res = smodel.Results.BaseReact()
+    except Exception:
+        return None
+
     if not res or res[0] != 0:
         return None
 
-    _, NumberResults, LoadCase, StepType, StepNum, F1, F2, F3, M1, M2, M3 = res
+    _, number_results, *_rest = res
+    if number_results == 0:
+        return None
 
-    if NumberResults == 0:
-        return None# فرض: F1 و F2 و ... لیست هستند
-    max_fx = max(abs(f) for f in F1)
-    max_fy = max(abs(f) for f in F2)
-
-    return max(max_fx, max_fy)
-
-
-
-# ===================== مونت‌کارلو اصلی =====================
-results = []
-
-ETABS = connect_to_etabs()
-smodel = ETABS.SapModel
-
-print(f"شروع مونت‌کارلو با {N_SAMPLES} نمونه...")
-start_time = time.time()
-
-
-
-
-
-
-def connect_to_etabs():
+    # انتظار داریم نیروهای محوری در ابتدای تاپل باشند
     try:
-        # اگر ETABS بازه بهش وصل می‌شیم
-        ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
-    except:
-        # وگرنه خودش ETABS رو اجرا می‌کنه
-        ETABSObject = comtypes.client.CreateObject("CSI.ETABS.API.ETABSObject")
-        # بهتره از مسیر مشخص‌شده استفاده کنیم
-        ETABSObject.ApplicationStart(ETABS_PATH)
-    return ETABSObject
+        F1 = res[-6]
+        F2 = res[-5]
+        max_fx = max(abs(f) for f in F1)
+        max_fy = max(abs(f) for f in F2)
+        return max(max_fx, max_fy)
+    except Exception:
+        return None
 
-ETABS = connect_to_etabs()
-smodel = ETABS.SapModel
 
-# حتماً مدل رو باز کن
-if not open_model(smodel, MODEL_PATH):
-    raise RuntimeError(f"مدل {MODEL_PATH} باز نشد")
+def run_monte_carlo(
+    smodel,
+    n_samples=DEFAULT_N_SAMPLES,
+    rng_seed=None,
+    save_csv=None,
+    verbose=True,
+):
+    """
+    اجرای مونت‌کارلو روی مدل باز شده در ETABS.
+    smodel: SapModel فعال
+    n_samples: تعداد نمونه
+    save_csv: مسیر فایل خروجی CSV (اختیاری)
+    """
+    rng = np.random.default_rng(rng_seed)
+    results = []
+    start = time.time()
 
-print(f"شروع مونت‌کارلو با {N_SAMPLES} نمونه...")
-start_time = time.time()
+    for i in range(n_samples):
+        sample = _sample_random_variables(rng, random_variables)
+        row = {**sample}
+        try:
+            set_material_properties(
+                smodel,
+                Fc=sample["Fc"],
+                Fy=sample["Fy"],
+                e_multiplier=sample["E_Concrete"],
+            )
+            set_load_multipliers(
+                smodel,
+                dead_mult=sample["Dead"],
+                live_mult=sample["Live"],
+            )
+            run_analysis(smodel)
+            row["max_drift"] = get_max_drift(smodel)
+            row["base_shear"] = get_base_shear(smodel)
+            row["error"] = ""
+        except Exception as exc:
+            row["max_drift"] = None
+            row["base_shear"] = None
+            row["error"] = str(exc)
+
+        row["timestamp"] = datetime.now().isoformat()
+        results.append(row)
+
+        if verbose:
+            status = f"[{i+1}/{n_samples}] drift={row['max_drift']} base={row['base_shear']}"
+            if row["error"]:
+                status += f" | خطا: {row['error']}"
+            print(status)
+
+    elapsed = time.time() - start
+    if verbose:
+        print(f"مونت‌کارلو تمام شد ({n_samples} نمونه) در {elapsed:.1f} ثانیه.")
+
+    if save_csv:
+        try:
+            pd.DataFrame(results).to_csv(save_csv, index=False)
+            if verbose:
+                print(f"نتایج در {save_csv} ذخیره شد.")
+        except Exception as exc:
+            print(f"هشدار: ذخیره CSV ناموفق بود ({exc})")
+
+    return results
+
+
+__all__ = [
+    "run_monte_carlo",
+    "random_variables",
+    "set_material_properties",
+    "set_load_multipliers",
+    "get_max_drift",
+    "get_base_shear",
+]

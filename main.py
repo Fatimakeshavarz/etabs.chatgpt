@@ -1,5 +1,6 @@
 # main.py
 import importlib.util
+import importlib.machinery
 from pathlib import Path
 from etabs_chatgpt import load_model_from_path
 from etabs_interface import disconnect_from_etabs, print_model_path
@@ -8,14 +9,19 @@ from etabs_interface import disconnect_from_etabs, print_model_path
 def _load_monte_carlo_module():
     script_path = Path(__file__).with_name("mont.karlo")
     if not script_path.exists():
+        # تلاش برای فایل معمولی .py
+        script_path = Path(__file__).with_name("mont.py")
+    if not script_path.exists():
         raise FileNotFoundError(f"فایل مونت‌کارلو یافت نشد: {script_path}")
 
-    spec = importlib.util.spec_from_file_location("monte_carlo_script", script_path)
-    if spec is None or spec.loader is None:
-        raise ImportError("عدم توانایی در ساخت spec برای mont.karlo")
+    # به صورت صریح لودر را مشخص می‌کنیم تا پسوند غیرمعمول کار کند.
+    loader = importlib.machinery.SourceFileLoader("monte_carlo_script", str(script_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"عدم توانایی در ساخت spec برای {script_path.name}")
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    loader.exec_module(module)
     return module
 
 

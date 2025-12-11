@@ -42,19 +42,31 @@ def generate_samples(n_samples):
 # ========================= اتصال به ETABS =========================
 def attach_to_etabs():
     print("در حال اتصال به ETABS در حال اجرا...")
-    ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
-    print("اتصال موفق! ETABS در حال اجراست")
+    try:
+        ETABSObject = comtypes.client.GetActiveObject("CSI.ETABS.API.ETABSObject")
+        print("اتصال موفق! ETABS در حال اجراست")
+    except (OSError, comtypes.COMError):
+        print("ETABS باز نیست، در حال راه‌اندازی نمونه جدید...")
+        ETABSObject = comtypes.client.CreateObject("CSI.ETABS.API.ETABSObject")
+        # ApplicationStart اگر ETABS در دسترس نباشد خطا می‌دهد، بنابراین در try نگه می‌داریم
+        try:
+            ETABSObject.ApplicationStart()
+            print("ETABS جدید راه‌اندازی شد.")
+        except Exception as exc:
+            raise RuntimeError(f"راه‌اندازی ETABS ناموفق بود: {exc}")
+
     smodel = ETABSObject.SapModel
     return ETABSObject, smodel
 
 # ========================= اعمال پارامترهای تصادفی =========================
 def apply_material_properties(smodel, row):
     # 1. تغییر خواص بتن
-    E_conc = 4700 * np.sqrt(row["Fc"]) * 1000                  # kN/m²
-    smodel.PropMaterial.SetMPIsotropic("CONC", E_conc, 0.2, row["Fc"]*1e6, row["Fc"]*1e6, 0.0001)
+    E_conc = 4700 * np.sqrt(row["Fc"]) * 1000                  # kN/m² (تقریبی)
+    # امضای SetMPIsotropic فقط 4 ورودی دارد (Name, E, Poisson, ThermalExp)
+    smodel.PropMaterial.SetMPIsotropic("CONC", E_conc, 0.2, 1e-5)
 
     # 2. تغییر خواص فولاد
-    smodel.PropMaterial.SetMPIsotropic("A615Gr60", 200e6, 0.3, row["Fy"]*1e6, row["Fy"]*1e6, 0.0001)
+    smodel.PropMaterial.SetMPIsotropic("A615Gr60", 200e6, 0.3, 1.2e-5)
 
     # 3. تغییر ضرایب بار در ترکیب بارها (Load Combinations)
     ret, NumberNames, ComboNames = smodel.RespCombo.GetComboList()
